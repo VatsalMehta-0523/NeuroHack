@@ -1,5 +1,7 @@
 from typing import List, Dict, Any, Callable, Optional
 import math
+import json
+from .db import get_db_connection
 
 # Intent Detection mappings
 # Maps detectable user intents to memory types that should be retrieved
@@ -43,41 +45,78 @@ def detect_intent(user_input: str) -> str:
         
     return "CHIT_CHAT"
 
+def retrieve_memories(user_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Retrieves ALL memories for a user from the database.
+    """
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            SELECT user_id, key, value, intent, metadata, created_at, updated_at
+            FROM memories
+            WHERE user_id = %s
+            ORDER BY updated_at DESC
+            LIMIT %s;
+        """, (user_id, limit))
+        
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        memories = []
+        for row in rows:
+            try:
+                metadata = json.loads(row[4]) if row[4] else {}
+            except:
+                metadata = {}
+            
+            memories.append({
+                'user_id': row[0],
+                'key': row[1],
+                'value': row[2],
+                'intent': row[3],
+                'metadata': metadata,
+                'created_at': str(row[5]),
+                'updated_at': str(row[6])
+            })
+        
+        print(f"✓ Retrieved {len(memories)} memories for user {user_id}")
+        return memories
+        
+    except Exception as e:
+        print(f"✗ Memory retrieval failed: {e}")
+        return []
+
+
 def calculate_relevance(
     memory: Dict[str, Any], 
     user_input: str
 ) -> float:
     """
-    Calculates a relevance score between a memory and the user input.
-    1.0 = Direct match / Highly relevant
-    0.0 = Irrelevant
-    
-    Current implementation uses keyword overlap as a proxy for semantic relevance.
+    Calculates relevance score between a memory and user input.
+    Returns 0.0-1.0
     """
     memory_content = (f"{memory.get('key', '')} {memory.get('value', '')}").lower()
     input_tokens = set(user_input.lower().split())
     memory_tokens = set(memory_content.split())
     
-    if not memory_tokens:
+    if not memory_tokens or not input_tokens:
         return 0.0
-        
-    # Intersection over Union (Jaccard-ish) or just simple overlap ratio?
-    # Let's use simple overlap for now as keys are usually concise
+    
     overlap = len(input_tokens.intersection(memory_tokens))
     
     # Boost for exact key match
     if memory.get('key', '').lower() in user_input.lower():
         overlap += 2
-        
+    
     if overlap == 0:
-        return 0.1 # Small base probability to allow high confidence/fresh memories to surface if decay is high? No, explicit relevance is key.
-                   # Actually, let's return 0.05 to avoid zeroing out completely IF we want serendipity, but strict rules say minimize context.
-                   # Setting to 0.0 creates a strict filter.
         return 0.0
-
-    # Normalize roughly to 0-1
-    score = min(1.0, overlap / 3.0) 
+    
+    score = min(1.0, overlap / max(len(input_tokens), len(memory_tokens)))
     return score
+
 
 def retrieve_relevant_memories(
     user_input: str,
@@ -136,6 +175,28 @@ def retrieve_relevant_memories(
     scored_memories.sort(key=lambda x: x["retrieval_score"], reverse=True)
     
     return scored_memories[:top_k]
+
+
+def search_memories(user_id: str, query: str, threshold: float = 0.1) -> List[Dict[str, Any]]:
+    """
+    Searches memories by relevance to the query.
+    """
+    all_memories = retrieve_memories(user_id, limit=100)
+    
+    scored_memories = [
+        (memory, calculate_relevance(memory, query))
+        for memory in all_memories
+    ]
+    
+    # Filter by threshold and sort by score
+    relevant = [
+        m for m, score in scored_memories 
+        if score >= threshold
+    ]
+    relevant.sort(key=lambda m: calculate_relevance(m, query), reverse=True)
+    
+    print(f"✓ Found {len(relevant)} relevant memories for query: '{query}'")
+    return relevant[:5]
 
 
 """

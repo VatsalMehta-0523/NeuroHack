@@ -1,57 +1,101 @@
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from typing import List, Dict, Optional, Any
+from dotenv import load_dotenv
 import uuid
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+import json
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_db_connection():
-    """Establishes a connection to the PostgreSQL database."""
-    # Move environment variable reading inside the function
-    # to avoid import-time errors before load_dotenv() runs.
-    database_url = os.getenv("DATABASE_URL")
-    
-    if not database_url:
-        raise ValueError("DATABASE_URL environment variable is not set. Ensure .env is loaded.")
-        
+    """Creates and returns a database connection."""
     try:
-        conn = psycopg2.connect(database_url)
+        conn = psycopg2.connect(DATABASE_URL)
         return conn
     except Exception as e:
-        print(f"Error connecting to database: {e}")
-        raise e
+        print(f"Database connection error: {e}")
+        raise
 
 def init_db():
-    """Initializes the database schema if it does not exist."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    # Create the memories table
-    create_table_query = """
-    CREATE TABLE IF NOT EXISTS memories (
-        memory_id TEXT PRIMARY KEY,
-        type TEXT NOT NULL CHECK (type IN ('preference', 'constraint', 'commitment', 'instruction', 'fact')),
-        key TEXT NOT NULL,
-        value TEXT NOT NULL,
-        confidence FLOAT NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
-        source_turn INTEGER NOT NULL,
-        last_used_turn INTEGER NOT NULL DEFAULT 0,
-        decay_score FLOAT NOT NULL CHECK (decay_score >= 0 AND decay_score <= 1),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE (type, key)
-    );
     """
-    
+    Initializes the database with required tables for long-form memory.
+    """
     try:
-        cur.execute(create_table_query)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Drop old table if exists (for clean migration)
+        cur.execute("DROP TABLE IF EXISTS memories;")
+        
+        # Create memories table with proper long-term memory schema
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                memory_id VARCHAR(50) PRIMARY KEY,
+                user_id VARCHAR(255) NOT NULL,
+                type VARCHAR(50) NOT NULL,
+                key VARCHAR(255) NOT NULL,
+                value TEXT NOT NULL,
+                confidence FLOAT DEFAULT 1.0,
+                source_turn INTEGER NOT NULL,
+                last_used_turn INTEGER DEFAULT 0,
+                decay_score FLOAT DEFAULT 1.0,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(user_id, type, key)
+            );
+        """)
+        
+        # Create indexes for fast retrieval
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_user_id_type 
+            ON memories(user_id, type);
+        """)
+        
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_user_id_turn 
+            ON memories(user_id, last_used_turn DESC);
+        """)
+        
+        # Create memory_usage table for analytics
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memory_usage (
+                id SERIAL PRIMARY KEY,
+                memory_id VARCHAR(50) REFERENCES memories(memory_id),
+                used_at_turn INTEGER NOT NULL,
+                relevance_score FLOAT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        
         conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
         cur.close()
         conn.close()
+        print("✓ Long-term memory database initialized successfully")
+        
+    except Exception as e:
+        print(f"✗ Database initialization failed: {e}")
+        raise
+
+def query_db(sql: str, params=None):
+    """Executes a query and returns results."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(sql, params or ())
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+        return results
+    except Exception as e:
+        print(f"Query error: {e}")
+        return []
 
 def add_memory(
+    user_id: str,
     memory_type: str,
     key: str,
     value: str,
@@ -65,33 +109,38 @@ def add_memory(
     conn = get_db_connection()
     cur = conn.cursor()
     
-    new_memory_id = f"mem_{uuid.uuid4().hex[:8]}"
+    memory_id = f"mem_{uuid.uuid4().hex[:12]}"
     
     upsert_query = """
-    INSERT INTO memories (memory_id, type, key, value, confidence, source_turn, last_used_turn, decay_score)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (type, key)
+    INSERT INTO memories (memory_id, user_id, type, key, value, confidence, source_turn, last_used_turn, decay_score)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (user_id, type, key)
     DO UPDATE SET
-        value = EXCLUDED.value,
-        confidence = EXCLUDED.confidence,
-        source_turn = EXCLUDED.source_turn,
-        last_used_turn = EXCLUDED.last_used_turn,
-        decay_score = EXCLUDED.decay_score
-    WHERE EXCLUDED.confidence >= memories.confidence
+        value = CASE 
+            WHEN EXCLUDED.confidence >= memories.confidence 
+            THEN EXCLUDED.value 
+            ELSE memories.value 
+        END,
+        confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
+        source_turn = LEAST(memories.source_turn, EXCLUDED.source_turn),
+        updated_at = NOW(),
+        decay_score = GREATEST(memories.decay_score, 0.5) -- Preserve some decay if already decayed
+    WHERE EXCLUDED.confidence >= memories.confidence * 0.8  -- Update if significantly better
     RETURNING memory_id;
     """
     
     try:
-        # Initial decay score is 1.0 (fresh)
+        # Initial last_used_turn is source_turn, decay_score starts at 1.0
         cur.execute(upsert_query, (
-            new_memory_id,
+            memory_id,
+            user_id,
             memory_type,
             key,
             value,
             confidence,
             source_turn,
-            source_turn, 
-            1.0          
+            source_turn,  # last_used_turn initially = source_turn
+            1.0          # decay_score starts fresh
         ))
         
         result = cur.fetchone()
@@ -100,44 +149,57 @@ def add_memory(
         if result:
             return result[0]
         else:
-            # If no row returned, fetch existing ID
-            cur.execute("SELECT memory_id FROM memories WHERE type = %s AND key = %s", (memory_type, key))
-            existing_id = cur.fetchone()[0]
-            return existing_id
+            # If no row returned (conflict but not updated), fetch existing ID
+            cur.execute("""
+                SELECT memory_id FROM memories 
+                WHERE user_id = %s AND type = %s AND key = %s
+            """, (user_id, memory_type, key))
+            existing = cur.fetchone()
+            return existing[0] if existing else memory_id
 
     except Exception as e:
         conn.rollback()
+        print(f"Error adding memory: {e}")
         raise e
     finally:
         cur.close()
         conn.close()
 
-def get_memories(
+def get_memories_by_types(
+    user_id: str,
     memory_types: Optional[List[str]] = None,
     limit: int = 100
 ) -> List[Dict[str, Any]]:
     """
-    Fetches memories, optionally filtered by type.
+    Fetches memories filtered by type for a specific user.
     """
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    query = "SELECT * FROM memories"
-    params = []
-    
     if memory_types:
-        query += " WHERE type = ANY(%s)"
-        params.append(memory_types)
-        
-    query += " ORDER BY last_used_turn DESC LIMIT %s"
-    params.append(limit)
+        query = """
+            SELECT * FROM memories 
+            WHERE user_id = %s AND type = ANY(%s)
+            ORDER BY last_used_turn DESC, confidence DESC
+            LIMIT %s
+        """
+        params = (user_id, memory_types, limit)
+    else:
+        query = """
+            SELECT * FROM memories 
+            WHERE user_id = %s
+            ORDER BY last_used_turn DESC, confidence DESC
+            LIMIT %s
+        """
+        params = (user_id, limit)
     
     try:
-        cur.execute(query, tuple(params))
+        cur.execute(query, params)
         rows = cur.fetchall()
         return [dict(row) for row in rows]
     except Exception as e:
-        raise e
+        print(f"Error fetching memories: {e}")
+        return []
     finally:
         cur.close()
         conn.close()
@@ -145,13 +207,16 @@ def get_memories(
 def update_memory_decay(memory_id: str, new_decay: float, last_used_turn: int):
     """
     Updates the decay score and last used turn for a specific memory.
+    Implements exponential decay based on usage.
     """
     conn = get_db_connection()
     cur = conn.cursor()
     
     query = """
     UPDATE memories
-    SET decay_score = %s, last_used_turn = %s
+    SET decay_score = %s, 
+        last_used_turn = %s,
+        updated_at = NOW()
     WHERE memory_id = %s;
     """
     
@@ -160,24 +225,78 @@ def update_memory_decay(memory_id: str, new_decay: float, last_used_turn: int):
         conn.commit()
     except Exception as e:
         conn.rollback()
+        print(f"Error updating memory decay: {e}")
         raise e
     finally:
         cur.close()
         conn.close()
 
-def delete_memory(memory_id: str):
-    """Deletes a memory by ID."""
+def record_memory_usage(memory_id: str, used_at_turn: int, relevance_score: float):
+    """
+    Records when a memory was used for analytics and decay calculation.
+    """
     conn = get_db_connection()
     cur = conn.cursor()
     
-    query = "DELETE FROM memories WHERE memory_id = %s"
+    query = """
+    INSERT INTO memory_usage (memory_id, used_at_turn, relevance_score)
+    VALUES (%s, %s, %s);
+    """
     
     try:
-        cur.execute(query, (memory_id,))
+        cur.execute(query, (memory_id, used_at_turn, relevance_score))
         conn.commit()
     except Exception as e:
         conn.rollback()
-        raise e
+        print(f"Error recording memory usage: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+def get_memory_statistics(user_id: str) -> Dict[str, Any]:
+    """
+    Returns statistics about memory usage and effectiveness.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        # Get total memories
+        cur.execute("SELECT COUNT(*) as count FROM memories WHERE user_id = %s", (user_id,))
+        total = cur.fetchone()['count']
+        
+        # Get memory type distribution
+        cur.execute("""
+            SELECT type, COUNT(*) as count 
+            FROM memories 
+            WHERE user_id = %s 
+            GROUP BY type
+        """, (user_id,))
+        type_dist = cur.fetchall()
+        
+        # Get average confidence
+        cur.execute("SELECT AVG(confidence) as avg_confidence FROM memories WHERE user_id = %s", (user_id,))
+        avg_conf = cur.fetchone()['avg_confidence'] or 0
+        
+        # Get recently used memories
+        cur.execute("""
+            SELECT COUNT(*) as recently_used 
+            FROM memories 
+            WHERE user_id = %s AND last_used_turn > 0
+        """, (user_id,))
+        recent = cur.fetchone()['recently_used']
+        
+        return {
+            'total_memories': total,
+            'type_distribution': {row['type']: row['count'] for row in type_dist},
+            'average_confidence': round(float(avg_conf), 3),
+            'recently_used': recent,
+            'utilization_rate': round(recent / max(total, 1) * 100, 1)
+        }
+        
+    except Exception as e:
+        print(f"Error getting memory statistics: {e}")
+        return {}
     finally:
         cur.close()
         conn.close()

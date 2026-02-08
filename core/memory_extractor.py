@@ -1,169 +1,283 @@
-from typing import List, Dict, Any, TypedDict, Optional
 import json
-
-# Define the structure for a returnable memory object
-# This matches the schema but without database-generated fields (id, timestamps)
-class MemoryObject(TypedDict):
-    type: str # preference | constraint | commitment | instruction | fact
-    key: str
-    value: str
-    confidence: float
-    source_turn: int
-    decay_score: float # Initialized to 1.0
+import re
+from typing import List, Dict, Any, Callable, Optional
 
 def extract_memory_from_input(
     user_input: str, 
     turn_number: int, 
-    llm_extract_func=None # Dependency injection for LLM call
-) -> List[MemoryObject]:
+    llm_extract_func: Optional[Callable[[str], str]] = None
+) -> List[Dict[str, Any]]:
     """
-    Analyzes user input to extract high-signal long-term memories.
-    
-    Args:
-        user_input (str): The raw text from the user.
-        turn_number (int): The current conversation turn number.
-        llm_extract_func (callable): A function that takes a prompt and returns a JSON string.
-                                     Input: str (prompt) -> Output: str (JSON)
-                                     If None, returns empty list (safety).
-
-    Returns:
-        List[MemoryObject]: A list of extracted memories. Empty if no relevant info found.
+    Extracts high-signal long-term memories from user input.
+    Only extracts information worth remembering for 1000+ turns.
     """
-    
-    if not user_input or not user_input.strip():
+    if not user_input or len(user_input.strip()) < 3:
         return []
-
+    
+    # Use provided LLM function or create a mock for testing
     if llm_extract_func is None:
-        # Failsafe: if no LLM provided (e.g. unit testing without mock), return nothing
+        print("  ⚠️ No LLM extraction function provided")
         return []
+    
+    # Don't extract from questions
+    if user_input.strip().endswith('?'):
+        print("  ⚠️ Skipping extraction for question")
+        return []
+    
+    extraction_prompt = f"""Extract long-term memories from user statement: "{user_input}"
 
-    # System prompt strictly for extraction
-    # We ask the LLM to be conservative and only extract HIGH VALUE information.
-    extraction_prompt = f"""
-    You are a Memory Extraction System. Your task is to analyze the USER INPUT and extract crucial, long-term information.
-    
-    RULES:
-    1. Extract ONLY:
-       - User PREFERENCES (likes/dislikes/habits)
-       - Strict CONSTRAINTS (limitations/boundaries)
-       - Long-term COMMITMENTS (promises/agreements)
-       - Explicit INSTRUCTIONS (how to behave forever)
-       - Stable personal FACTS (name/job/location if permanent)
-    2. IGNORE:
-       - Casual chatter / Greetings
-       - Questions ("What is...?")
-       - Context-dependent short-term info
-       - Ambiguous statements
-    3. JSON OUTPUT FORMAT (List of objects):
-       [
-         {{
-           "type": "preference" | "constraint" | "commitment" | "instruction" | "fact",
-           "key": "concise_unique_identifier",
-           "value": "clear_extraction_value",
-           "confidence": float (0.0 to 1.0)
-         }}
-       ]
-    4. CONFIDENCE THRESHOLD: Only include items with confidence > 0.85.
-    5. If nothing relevant is found, return strict empty list: []
-    
-    USER INPUT (Turn {turn_number}):
-    "{user_input}"
-    
-    JSON OUTPUT:
-    """
+CRITICAL: Output must be a JSON array of memory objects.
+Each memory object MUST have: type, key, value, confidence
 
+Examples:
+- For "my name is John": [{{"type": "fact", "key": "name", "value": "John", "confidence": 0.95}}]
+- For "I like coffee": [{{"type": "preference", "key": "beverage", "value": "coffee", "confidence": 0.9}}]
+- If nothing to remember: []
+
+Output JSON array:"""
+    
     try:
-        # Call the injected LLM function
-        # We expect a pure JSON string response
+        print(f"  Sending extraction prompt...")
         raw_response = llm_extract_func(extraction_prompt)
         
-        # Parse JSON
-        extracted_data = json.loads(raw_response)
-        
-        if not isinstance(extracted_data, list):
-             # basic validation
+        if not raw_response or raw_response.strip() == "":
+            print("  ⚠️ Empty response from LLM")
             return []
-
-        memories: List[MemoryObject] = []
         
-        for item in extracted_data:
-            # Validate required fields
-            if not all(k in item for k in ("type", "key", "value", "confidence")):
-                continue
-                
-            # Validate types
-            valid_types = {"preference", "constraint", "commitment", "instruction", "fact"}
-            if item["type"] not in valid_types:
-                continue
-                
-            # Validate confidence (Double check logic, though prompt says > 0.85)
-            if item["confidence"] < 0.85:
-                continue
-
-            # Construct MemoryObject
-            memory: MemoryObject = {
-                "type": item["type"],
-                "key": item["key"],
-                "value": item["value"],
-                "confidence": item["confidence"],
-                "source_turn": turn_number,
-                "decay_score": 1.0
-            }
-            memories.append(memory)
-            
+        print(f"  Raw LLM response: {raw_response[:200]}...")
+        
+        # Parse JSON
+        extracted_data = _parse_json_response(raw_response)
+        
+        if extracted_data is None:
+            return []
+        
+        memories = []
+        # Handle different response formats
+        if isinstance(extracted_data, dict):
+            # Check if it has a "memories" key
+            if "memories" in extracted_data and isinstance(extracted_data["memories"], list):
+                extracted_data = extracted_data["memories"]
+            else:
+                # Single memory object
+                extracted_data = [extracted_data]
+        elif not isinstance(extracted_data, list):
+            print(f"  ✗ Expected dict or list, got {type(extracted_data)}")
+            return []
+        
+        for i, item in enumerate(extracted_data):
+            memory = _validate_and_create_memory(item, turn_number, user_input)
+            if memory:
+                memories.append(memory)
+                print(f"  ✓ Extracted: {memory['key']} = {memory['value'][:50]}...")
+        
+        print(f"  Total extracted: {len(memories)}")
         return memories
-
-    except json.JSONDecodeError:
-        # LLM failed to produce valid JSON
-        # In a real system we might log this, but for now safe fail
-        return []
+        
     except Exception as e:
-        # Catch-all for other errors
-        print(f"Error in memory extraction: {e}")
+        print(f"✗ Extraction error: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
+def _parse_json_response(raw_response: str):
+    """Parse JSON response with robust error handling."""
+    cleaned = raw_response.strip()
+    
+    # Remove markdown code blocks
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    
+    cleaned = cleaned.strip()
+    
+    # Try to parse as-is
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        print(f"  JSON parse error: {e}")
+    
+    # Try to find JSON object/array
+    try:
+        # Look for {...} or [...]
+        json_match = re.search(r'(\{.*\}|\[.*\])', cleaned, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(1))
+    except Exception as e:
+        print(f"  Regex parse error: {e}")
+    
+    print(f"  ✗ Could not parse JSON from: {cleaned[:100]}...")
+    return None
 
+def _validate_and_create_memory(item: Dict, turn_number: int, user_input: str) -> Optional[Dict[str, Any]]:
+    """Validate memory item and create memory object."""
+    try:
+        # Check if it's a valid memory object
+        if not isinstance(item, dict):
+            return None
+        
+        # Get fields
+        mem_type = str(item.get("type", "")).lower().strip()
+        key = str(item.get("key", "")).strip()
+        value = item.get("value", "")
+        
+        # Handle null/None value
+        if value is None:
+            print(f"  ✗ Skipping memory with null value: {key}")
+            return None
+        
+        value = str(value).strip()
+        
+        # Get confidence
+        confidence = item.get("confidence")
+        if confidence is None:
+            confidence = item.get("confidence_score", item.get("score", 0.8))
+        
+        try:
+            confidence = float(confidence)
+        except (ValueError, TypeError):
+            confidence = 0.8  # Default
+        
+        # Validate required fields
+        if not mem_type or not key or not value:
+            print(f"  ✗ Missing required fields: type={mem_type}, key={key}, value={value}")
+            return None
+        
+        # Skip if confidence is too low or value is problematic
+        if confidence < 0.5 or value.lower() in ["null", "none", "", "unknown"]:
+            print(f"  ✗ Skipping low-confidence or empty memory: {key}={value} (conf: {confidence})")
+            return None
+        
+        # Validate and normalize type
+        valid_types = {"preference", "constraint", "fact", "instruction", "commitment"}
+        if mem_type not in valid_types:
+            # Try to map to valid type
+            if mem_type in ["query", "question"]:
+                print(f"  ✗ Skipping query type memory")
+                return None
+            elif "name" in key.lower() or "location" in key.lower() or "job" in key.lower():
+                mem_type = "fact"
+            elif "like" in key.lower() or "prefer" in key.lower() or "hate" in key.lower():
+                mem_type = "preference"
+            else:
+                mem_type = "fact"  # Default
+        
+        # Ensure confidence is reasonable
+        confidence = max(0.5, min(1.0, confidence))
+        
+        # Additional validation based on user input
+        if len(value) < 2:  # Too short
+            print(f"  ✗ Value too short: '{value}'")
+            return None
+        
+        # Check if this looks like a real value vs placeholder
+        if value.lower() in ["n/a", "not specified", "unknown", "null"]:
+            print(f"  ✗ Skipping placeholder value: {value}")
+            return None
+        
+        return {
+            "type": mem_type,
+            "key": key,
+            "value": value,
+            "confidence": confidence,
+            "source_turn": turn_number
+        }
+        
+    except Exception as e:
+        print(f"  ✗ Error validating memory: {e}")
+        return None
 
-"""
-description : 
-
-Purpose
-
-Decides whether user input contains long-term memory.
-
-Responsibilities
-
-Analyze one user message
-
-Extract only high-signal information
-
-Reject noise, questions, chatter
-
-Output strict JSON-compatible memory objects
-
-What it explicitly does NOT do
-
-Does not write to DB
-
-Does not retrieve memory
-
-Does not influence responses
-
-Key Safeguards
-
-Confidence threshold (>0.85)
-
-Empty list is a valid outcome
-
-Safe failure on invalid JSON
-
-Why this matters
-
-This prevents:
-
-Memory pollution
-
-Hallucinated facts
-
-Storing irrelevant conversation
-"""
+def simple_extract_memory(user_input: str, turn_number: int) -> List[Dict[str, Any]]:
+    """Simple regex-based extraction as fallback."""
+    import re
+    memories = []
+    
+    user_input_lower = user_input.lower()
+    
+    # Skip questions
+    if user_input_lower.strip().endswith('?'):
+        return memories
+    
+    # Extract name (more robust patterns)
+    name_patterns = [
+        r"my name is ([A-Za-z]+(?: [A-Za-z]+)*)",
+        r"i am ([A-Za-z]+(?: [A-Za-z]+)*)",
+        r"call me ([A-Za-z]+(?: [A-Za-z]+)*)",
+        r"i'm ([A-Za-z]+(?: [A-Za-z]+)*)",
+        r"name is ([A-Za-z]+(?: [A-Za-z]+)*)"
+    ]
+    
+    for pattern in name_patterns:
+        match = re.search(pattern, user_input_lower)
+        if match:
+            name = match.group(1).title()
+            if len(name) > 1:  # Valid name
+                memories.append({
+                    "type": "fact",
+                    "key": "name",
+                    "value": name,
+                    "confidence": 0.95,
+                    "source_turn": turn_number
+                })
+                print(f"  ✓ Simple extraction: name = {name}")
+            break
+    
+    # Extract preferences (I like/love/enjoy)
+    preference_patterns = [
+        r"i like to ([a-z]+) ([a-z]+)",
+        r"i like ([a-z]+)",
+        r"i love ([a-z]+)",
+        r"i enjoy ([a-z]+)",
+        r"i love to ([a-z]+)"
+    ]
+    
+    for pattern in preference_patterns:
+        match = re.search(pattern, user_input_lower)
+        if match:
+            if len(match.groups()) == 2:
+                # Pattern like "I like to play chess"
+                activity = f"{match.group(1)} {match.group(2)}"
+                key = "activity"
+            else:
+                # Pattern like "I like chess"
+                activity = match.group(1)
+                key = "interest"
+            
+            if len(activity) > 2:
+                memories.append({
+                    "type": "preference",
+                    "key": key,
+                    "value": activity,
+                    "confidence": 0.85,
+                    "source_turn": turn_number
+                })
+                print(f"  ✓ Simple extraction: preference = {activity}")
+            break
+    
+    # Extract location
+    location_patterns = [
+        r"i live in ([A-Za-z]+(?: [A-Za-z]+)*)",
+        r"i'm from ([A-Za-z]+(?: [A-Za-z]+)*)",
+        r"my city is ([A-Za-z]+(?: [A-Za-z]+)*)",
+        r"in ([A-Za-z]+(?: [A-Za-z]+)*)"
+    ]
+    
+    for pattern in location_patterns:
+        match = re.search(pattern, user_input_lower)
+        if match:
+            location = match.group(1).title()
+            memories.append({
+                "type": "fact",
+                "key": "location",
+                "value": location,
+                "confidence": 0.90,
+                "source_turn": turn_number
+            })
+            print(f"  ✓ Simple extraction: location = {location}")
+            break
+    
+    return memories

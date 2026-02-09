@@ -1,107 +1,177 @@
 import os
 import json
-import requests
+import google.generativeai as genai
 from typing import Optional, Dict, Any
+from dotenv import load_dotenv
 
-# Groq API configuration
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL_NAME = "llama-3.3-70b-versatile"
+load_dotenv()
 
-def _call_groq_api(messages: list, temperature: float = 0.0, json_mode: bool = False) -> str:
-    """Internal helper to call Groq API."""
-    groq_api_key = os.getenv("GROQ_API_KEY")
+# Gemini API configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+MODEL_NAME = "gemini-2.5-flash"  # Options: gemini-1.5-pro, gemini-1.5-flash
+
+# Configure Gemini
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    print(f"✓ Gemini API configured with model: {MODEL_NAME}")
+else:
+    print("✗ Warning: GEMINI_API_KEY not found in environment variables")
+
+def _call_gemini_api(prompt: str, system_instruction: str = "", temperature: float = 0.7, json_mode: bool = False) -> str:
+    """
+    Internal helper to call Gemini API.
+    Args:
+        prompt (str): User prompt
+        system_instruction (str): System instruction
+        temperature (float): Creativity temperature (0.0-1.0)
+        json_mode (bool): Whether to enforce JSON output
+    Returns:
+        str: Content of the response
+    """
+    if not GEMINI_API_KEY:
+        return '{"error": "GEMINI_API_KEY not found"}'
     
-    if not groq_api_key:
-        print("Error: GROQ_API_KEY environment variable not set.")
-        return '{"error": "GROQ_API_KEY not found"}'
-
-    headers = {
-        "Authorization": f"Bearer {groq_api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "model": MODEL_NAME,
-        "messages": messages,
-        "temperature": temperature
-    }
-    
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-
     try:
-        response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+        # Configure generation parameters
+        generation_config = {
+            "temperature": 0.1 if json_mode else temperature,
+            "top_p": 0.95,
+            "top_k": 40,
+            "max_output_tokens": 2048,
+        }
+        
+        # Safety settings (adjust as needed)
+        safety_settings = [
+            {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+            }
+        ]
+        
+        # Enhance system instruction for JSON mode
+        if json_mode:
+            enhanced_system_instruction = system_instruction + "\n\nCRITICAL: Output MUST be valid JSON only. No explanations, no additional text."
+        else:
+            enhanced_system_instruction = system_instruction
+        
+        # Create the model
+        model = genai.GenerativeModel(
+            model_name=MODEL_NAME,
+            generation_config=generation_config,
+            safety_settings=safety_settings,
+            system_instruction=enhanced_system_instruction
+        )
+        
+        # Generate response
+        response = model.generate_content(prompt)
+        
+        # Check for blocked content
+        if response.prompt_feedback and response.prompt_feedback.block_reason:
+            print(f"⚠️ Content blocked: {response.prompt_feedback.block_reason}")
+            return ""
+        
+        # Extract text from response
+        if response and response.text:
+            text = response.text.strip()
+            
+            # For JSON responses, clean up common formatting issues
+            if json_mode:
+                # Remove markdown code blocks
+                text = text.replace("```json", "").replace("```", "").strip()
+                
+                # Sometimes Gemini adds explanations, extract just the JSON
+                try:
+                    # Find the first { or [ and last } or ]
+                    if "{" in text and "}" in text:
+                        start = text.find("{")
+                        end = text.rfind("}") + 1
+                        text = text[start:end]
+                    elif "[" in text and "]" in text:
+                        start = text.find("[")
+                        end = text.rfind("]") + 1
+                        text = text[start:end]
+                except:
+                    pass  # Keep as-is if parsing fails
+            
+            return text
+        else:
+            print(f"⚠️ Gemini returned empty response")
+            return ""
+            
     except Exception as e:
-        print(f"LLM API Call Error: {e}")
+        print(f"✗ Gemini API Error: {e}")
+        import traceback
+        traceback.print_exc()
         return ""
 
 def llm_extract_func(prompt: str) -> str:
     """
-    Extracts memory from text using LLM.
+    Extracts memory from text using Gemini.
+    Must return strict JSON string.
     """
-    messages = [
-        {
-            "role": "system", 
-            "content": """You are a memory extraction system. Extract ONLY factual, long-term information.
-            
-            RULES:
-            1. Extract personal facts: names, locations, jobs, education
-            2. Extract preferences: likes, dislikes, habits
-            3. Extract constraints: rules, limitations
-            4. DO NOT extract: questions, temporary info, casual chat
-            5. Output MUST be a JSON ARRAY
-            6. Each item MUST have: type, key, value, confidence (0.0-1.0)
-            7. If nothing to extract, return empty array: []
-            
-            Example outputs:
-            Input: "My name is John and I live in New York"
-            Output: [
-              {"type": "fact", "key": "name", "value": "John", "confidence": 0.95},
-              {"type": "fact", "key": "location", "value": "New York", "confidence": 0.9}
-            ]
-            
-            Input: "What is my name?"
-            Output: []
-            
-            Input: "I'm a software engineer"
-            Output: [{"type": "fact", "key": "occupation", "value": "software engineer", "confidence": 0.9}]
-            
-            REMEMBER: Always return a JSON array, even if empty."""
-        },
-        {"role": "user", "content": prompt}
-    ]
+    system_instruction = """You are a precise memory extraction system.
+
+RULES:
+1. Extract ONLY long-term information worth remembering:
+   - Personal facts (name, location, job, education)
+   - Preferences (likes, dislikes, hobbies)
+   - Constraints (rules, limitations)
+   - Commitments (promises, agreements)
+   - Instructions (how to behave)
+
+2. IGNORE:
+   - Questions
+   - Casual conversation
+   - Temporary information
+   - Context-dependent statements
+
+3. OUTPUT FORMAT: JSON array
+   Example for "my name is John":
+   [
+     {
+       "type": "fact",
+       "key": "name", 
+       "value": "John",
+       "confidence": 0.95
+     }
+   ]
+
+4. If nothing to extract, return: []
+
+Output only JSON, no other text."""
     
-    try:
-        response = _call_groq_api(messages, temperature=0.1, json_mode=True)
-        print(f"  Raw extraction response: {response[:200]}...")
-        
-        # Force array if single object (but not if empty array)
-        response = response.strip()
-        if response and response.startswith('{') and response.endswith('}'):
-            # Check if it has valid memory data
-            try:
-                data = json.loads(response)
-                if "type" in data and "key" in data and "value" in data:
-                    print("  ⚠️ Wrapping single memory object in array")
-                    response = f'[{response}]'
-            except:
-                pass
-        
-        return response
-    except Exception as e:
-        print(f"Extraction function error: {e}")
-        return "[]"
+    return _call_gemini_api(prompt, system_instruction, temperature=0.1, json_mode=True)
 
 def get_llm_response(system_prompt: str, user_input: str) -> str:
     """
-    Generates a natural language response.
+    Generates a natural language response using Gemini.
     """
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_input}
-    ]
+    return _call_gemini_api(user_input, system_prompt, temperature=0.7, json_mode=False)
+
+# For testing
+if __name__ == "__main__":
+    # Test the functions
+    print("Testing Gemini integration...")
     
-    return _call_groq_api(messages, temperature=0.7)
+    # Test extraction
+    test_prompt = "my name is John and I live in New York"
+    print(f"\nTest extraction for: '{test_prompt}'")
+    result = llm_extract_func(test_prompt)
+    print(f"Result: {result}")
+    
+    # Test chat
+    print("\nTest chat response...")
+    response = get_llm_response("You are a helpful assistant.", "Hello, how are you?")
+    print(f"Response: {response[:100]}...")

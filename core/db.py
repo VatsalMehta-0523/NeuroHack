@@ -20,66 +20,6 @@ def get_db_connection():
         print(f"Database connection error: {e}")
         raise
 
-def init_db():
-    """
-    Initializes the database with required tables for long-form memory.
-    """
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Drop old table if exists (for clean migration)
-        cur.execute("DROP TABLE IF EXISTS memories;")
-        
-        # Create memories table with proper long-term memory schema
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS memories (
-                memory_id VARCHAR(50) PRIMARY KEY,
-                user_id VARCHAR(255) NOT NULL,
-                type VARCHAR(50) NOT NULL,
-                key VARCHAR(255) NOT NULL,
-                value TEXT NOT NULL,
-                confidence FLOAT DEFAULT 1.0,
-                source_turn INTEGER NOT NULL,
-                last_used_turn INTEGER DEFAULT 0,
-                decay_score FLOAT DEFAULT 1.0,
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW(),
-                UNIQUE(user_id, type, key)
-            );
-        """)
-        
-        # Create indexes for fast retrieval
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_memories_user_id_type 
-            ON memories(user_id, type);
-        """)
-        
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_memories_user_id_turn 
-            ON memories(user_id, last_used_turn DESC);
-        """)
-        
-        # Create memory_usage table for analytics
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS memory_usage (
-                id SERIAL PRIMARY KEY,
-                memory_id VARCHAR(50) REFERENCES memories(memory_id),
-                used_at_turn INTEGER NOT NULL,
-                relevance_score FLOAT,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-        """)
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-        print("✓ Long-term memory database initialized successfully")
-        
-    except Exception as e:
-        print(f"✗ Database initialization failed: {e}")
-        raise
-
 def query_db(sql: str, params=None):
     """Executes a query and returns results."""
     try:
@@ -111,51 +51,48 @@ def add_memory(
     
     memory_id = f"mem_{uuid.uuid4().hex[:12]}"
     
-    upsert_query = """
-    INSERT INTO memories (memory_id, user_id, type, key, value, confidence, source_turn, last_used_turn, decay_score)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (user_id, type, key)
-    DO UPDATE SET
-        value = CASE 
-            WHEN EXCLUDED.confidence >= memories.confidence 
-            THEN EXCLUDED.value 
-            ELSE memories.value 
-        END,
-        confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
-        source_turn = LEAST(memories.source_turn, EXCLUDED.source_turn),
-        updated_at = NOW(),
-        decay_score = GREATEST(memories.decay_score, 0.5) -- Preserve some decay if already decayed
-    WHERE EXCLUDED.confidence >= memories.confidence * 0.8  -- Update if significantly better
-    RETURNING memory_id;
-    """
+    # First, check if memory exists
+    cur.execute("""
+        SELECT memory_id, confidence FROM memories 
+        WHERE user_id = %s AND type = %s AND key = %s
+    """, (user_id, memory_type, key))
+    
+    existing = cur.fetchone()
     
     try:
-        # Initial last_used_turn is source_turn, decay_score starts at 1.0
-        cur.execute(upsert_query, (
-            memory_id,
-            user_id,
-            memory_type,
-            key,
-            value,
-            confidence,
-            source_turn,
-            source_turn,  # last_used_turn initially = source_turn
-            1.0          # decay_score starts fresh
-        ))
-        
-        result = cur.fetchone()
-        conn.commit()
-        
-        if result:
-            return result[0]
+        if existing:
+            existing_id, existing_confidence = existing
+            # Only update if new confidence is significantly better
+            if confidence >= existing_confidence * 0.8:
+                cur.execute("""
+                    UPDATE memories 
+                    SET value = %s,
+                        confidence = GREATEST(confidence, %s),
+                        updated_at = NOW(),
+                        decay_score = GREATEST(decay_score, 0.5)
+                    WHERE memory_id = %s
+                    RETURNING memory_id
+                """, (value, confidence, existing_id))
+                conn.commit()
+                return existing_id
+            else:
+                # Don't update, return existing ID
+                return existing_id
         else:
-            # If no row returned (conflict but not updated), fetch existing ID
+            # Insert new memory
             cur.execute("""
-                SELECT memory_id FROM memories 
-                WHERE user_id = %s AND type = %s AND key = %s
-            """, (user_id, memory_type, key))
-            existing = cur.fetchone()
-            return existing[0] if existing else memory_id
+                INSERT INTO memories (
+                    memory_id, user_id, type, key, value, 
+                    confidence, source_turn, last_used_turn, decay_score
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING memory_id
+            """, (
+                memory_id, user_id, memory_type, key, value,
+                confidence, source_turn, source_turn, 1.0
+            ))
+            conn.commit()
+            return memory_id
 
     except Exception as e:
         conn.rollback()
@@ -263,7 +200,8 @@ def get_memory_statistics(user_id: str) -> Dict[str, Any]:
     try:
         # Get total memories
         cur.execute("SELECT COUNT(*) as count FROM memories WHERE user_id = %s", (user_id,))
-        total = cur.fetchone()['count']
+        total_result = cur.fetchone()
+        total = total_result['count'] if total_result else 0
         
         # Get memory type distribution
         cur.execute("""
@@ -276,7 +214,8 @@ def get_memory_statistics(user_id: str) -> Dict[str, Any]:
         
         # Get average confidence
         cur.execute("SELECT AVG(confidence) as avg_confidence FROM memories WHERE user_id = %s", (user_id,))
-        avg_conf = cur.fetchone()['avg_confidence'] or 0
+        avg_conf_result = cur.fetchone()
+        avg_conf = avg_conf_result['avg_confidence'] if avg_conf_result and avg_conf_result['avg_confidence'] else 0
         
         # Get recently used memories
         cur.execute("""
@@ -284,7 +223,8 @@ def get_memory_statistics(user_id: str) -> Dict[str, Any]:
             FROM memories 
             WHERE user_id = %s AND last_used_turn > 0
         """, (user_id,))
-        recent = cur.fetchone()['recently_used']
+        recent_result = cur.fetchone()
+        recent = recent_result['recently_used'] if recent_result else 0
         
         return {
             'total_memories': total,
@@ -296,7 +236,143 @@ def get_memory_statistics(user_id: str) -> Dict[str, Any]:
         
     except Exception as e:
         print(f"Error getting memory statistics: {e}")
-        return {}
+        return {
+            'total_memories': 0,
+            'type_distribution': {},
+            'average_confidence': 0.0,
+            'recently_used': 0,
+            'utilization_rate': 0.0
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+def record_memory_usage_batch(memory_ids: List[str], used_at_turn: int, relevance_scores: List[float]):
+    """
+    Records multiple memory usages in batch for efficiency.
+    """
+    if not memory_ids:
+        return
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Prepare batch insert
+        values = []
+        for mem_id, score in zip(memory_ids, relevance_scores):
+            values.append((mem_id, used_at_turn, score))
+        
+        query = """
+        INSERT INTO memory_usage (memory_id, used_at_turn, relevance_score)
+        VALUES (%s, %s, %s);
+        """
+        
+        cur.executemany(query, values)
+        conn.commit()
+        print(f"✓ Recorded {len(memory_ids)} memory usages at turn {used_at_turn}")
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"✗ Error recording memory usage batch: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+def get_memory_usage_stats(user_id: str, days_back: int = 30) -> Dict[str, Any]:
+    """
+    Returns memory usage statistics.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        # Total usage count
+        cur.execute("""
+            SELECT COUNT(*) as total_usage_count
+            FROM memory_usage mu
+            JOIN memories m ON mu.memory_id = m.memory_id
+            WHERE m.user_id = %s
+            AND mu.created_at >= NOW() - INTERVAL '%s days'
+        """, (user_id, days_back))
+        total_usage_result = cur.fetchone()
+        total_usage = total_usage_result['total_usage_count'] if total_usage_result else 0
+        
+        # Most used memories
+        cur.execute("""
+            SELECT m.key, m.value, m.type, COUNT(mu.id) as usage_count,
+                   AVG(mu.relevance_score) as avg_relevance
+            FROM memory_usage mu
+            JOIN memories m ON mu.memory_id = m.memory_id
+            WHERE m.user_id = %s
+            GROUP BY m.memory_id, m.key, m.value, m.type
+            ORDER BY usage_count DESC
+            LIMIT 10
+        """, (user_id,))
+        top_memories = cur.fetchall()
+        
+        # Unused memories
+        cur.execute("""
+            SELECT COUNT(*) as unused_count
+            FROM memories m
+            WHERE m.user_id = %s
+            AND NOT EXISTS (
+                SELECT 1 FROM memory_usage mu 
+                WHERE mu.memory_id = m.memory_id
+            )
+        """, (user_id,))
+        unused_result = cur.fetchone()
+        unused_count = unused_result['unused_count'] if unused_result else 0
+        
+        # Get total memories for utilization rate
+        total_memories = get_memory_statistics(user_id).get('total_memories', 1)
+        
+        return {
+            'total_usage_count': total_usage,
+            'top_memories': [dict(row) for row in top_memories],
+            'unused_memories_count': unused_count,
+            'utilization_rate': round(
+                (1 - unused_count / max(total_memories, 1)) * 100, 
+                1
+            ) if total_usage > 0 else 0
+        }
+        
+    except Exception as e:
+        print(f"Error getting memory usage stats: {e}")
+        return {
+            'total_usage_count': 0,
+            'top_memories': [],
+            'unused_memories_count': 0,
+            'utilization_rate': 0.0
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+def cleanup_old_memory_usage(days_to_keep: int = 90):
+    """
+    Cleans up old memory usage records to prevent database bloat.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        query = f"""
+            DELETE FROM memory_usage 
+            WHERE created_at < NOW() - INTERVAL '{days_to_keep} days'
+        """
+        cur.execute(query)
+        
+        deleted_count = cur.rowcount
+        conn.commit()
+        
+        print(f"✓ Cleaned up {deleted_count} old memory usage records")
+        return deleted_count
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"✗ Error cleaning up memory usage: {e}")
+        return 0
     finally:
         cur.close()
         conn.close()

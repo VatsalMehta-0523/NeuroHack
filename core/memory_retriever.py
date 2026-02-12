@@ -5,8 +5,6 @@ from .db import get_db_connection
 
 # Intent Detection mappings
 # Maps detectable user intents to memory types that should be retrieved
-# Intent Detection mappings
-# Maps detectable user intents to memory types that should be retrieved
 INTENT_MEMORY_MAP = {
     "SCHEDULING": ["preference", "constraint", "commitment", "instruction"],
     "COMMUNICATION": ["preference", "instruction", "fact"], 
@@ -90,32 +88,28 @@ def retrieve_memories(user_id: str, limit: int = 5) -> List[Dict[str, Any]]:
         return []
 
 
-def calculate_relevance(
-    memory: Dict[str, Any], 
-    user_input: str
-) -> float:
-    """
-    Calculates relevance score between a memory and user input.
-    Returns 0.0-1.0
-    """
-    memory_content = (f"{memory.get('key', '')} {memory.get('value', '')}").lower()
-    input_tokens = set(user_input.lower().split())
-    memory_tokens = set(memory_content.split())
-    
-    if not memory_tokens or not input_tokens:
-        return 0.0
-    
-    overlap = len(input_tokens.intersection(memory_tokens))
-    
-    # Boost for exact key match
-    if memory.get('key', '').lower() in user_input.lower():
-        overlap += 2
-    
-    if overlap == 0:
-        return 0.0
-    
-    score = min(1.0, overlap / max(len(input_tokens), len(memory_tokens)))
-    return score
+def calculate_relevance(memory, user_input):
+    text = f"{memory['key']} {memory['value']}".lower()
+    query = user_input.lower()
+
+    score = 0.0
+
+    # Exact key mention
+    if memory['key'].lower() in query:
+        score += 0.6
+
+    # Phrase containment
+    if memory['value'].lower() in query:
+        score += 0.6
+
+    # Token overlap
+    q_tokens = set(query.split())
+    m_tokens = set(text.split())
+    overlap = len(q_tokens & m_tokens)
+
+    score += min(0.4, overlap / max(len(m_tokens), 1))
+
+    return min(score, 1.0)
 
 
 def retrieve_relevant_memories(
@@ -159,8 +153,9 @@ def retrieve_relevant_memories(
         # Score components
         relevance = calculate_relevance(memory, user_input)
         confidence = memory.get('confidence', 1.0)
-        decay = memory.get('decay_score', 1.0)
-        
+        age = turn_number - memory['last_used_turn']
+        decay = math.exp(-age / 20)
+
         # Combined Score
         # We weigh relevance highest. If it's not relevant, confidence doesn't matter.
         final_score = relevance * confidence * decay

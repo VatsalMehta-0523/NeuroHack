@@ -2,54 +2,60 @@ import streamlit as st
 import sys
 import os
 from dotenv import load_dotenv
-import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime
+import time
 
-# --------------------------------------------------
-# Environment + Path Setup
-# --------------------------------------------------
 load_dotenv()
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# --------------------------------------------------
-# Core Imports
-# --------------------------------------------------
-from core.db import init_db
-from core.llm_interface import get_llm_response, llm_extract_func
-from core.memory_controller import LongTermMemoryController
+from core.memory_controller import OptimizedMemoryController
+from core.db import get_db_connection
 
-# --------------------------------------------------
-# Initialize Database
-# --------------------------------------------------
+# Detect database type
 @st.cache_resource
-def initialize_system():
-    """Initialize the memory system once per session."""
+def detect_db_type():
+    """Detect whether we're using SQLite or PostgreSQL."""
     try:
-        init_db()
+        conn = get_db_connection()
+        # Check if it's a PostgreSQL connection
+        if hasattr(conn, 'get_dsn_parameters'):
+            db_type = 'postgresql'
+        else:
+            db_type = 'sqlite'
+        conn.close()
+        return db_type
+    except Exception:
+        return 'sqlite'
+
+DB_TYPE = detect_db_type()
+PARAM_PLACEHOLDER = '%s' if DB_TYPE == 'postgresql' else '?'
+
+# Check Database Connection
+@st.cache_resource
+def check_database():
+    """Verify database connection."""
+    try:
+        conn = get_db_connection()
+        conn.close()
         return True
     except Exception as e:
-        st.error(f"Database initialization failed: {e}")
+        st.error(f"❌ Database Connection Failed: {e}")
+        st.info("Please run 'python init_db.py' first to initialize the database")
         return False
 
-# Initialize system
-if not initialize_system():
+if not check_database():
     st.stop()
 
-# --------------------------------------------------
-# Streamlit Page Config
-# --------------------------------------------------
+# Streamlit config
 st.set_page_config(
-    page_title="NeuroHack - Long-Term Memory AI",
+    page_title="NeuroHack - Memory AI",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --------------------------------------------------
 # Session State Initialization
-# --------------------------------------------------
 if "user_id" not in st.session_state:
     st.session_state.user_id = "demo_user_001"
 
@@ -60,293 +66,389 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 if "memory_controller" not in st.session_state:
-    st.session_state.memory_controller = LongTermMemoryController(
-        user_id=st.session_state.user_id,
-        llm_response_func=get_llm_response,
-        llm_extract_func=llm_extract_func  # Fixed: passing the correct function
-    )
+    try:
+        st.session_state.memory_controller = OptimizedMemoryController(
+            user_id=st.session_state.user_id
+        )
+    except Exception as e:
+        st.error(f"Failed to initialize memory controller: {e}")
+        st.stop()
 
 if "conversation_history" not in st.session_state:
     st.session_state.conversation_history = []
 
-if "show_memory_details" not in st.session_state:
-    st.session_state.show_memory_details = False
+if "show_debug" not in st.session_state:
+    st.session_state.show_debug = False
 
-# --------------------------------------------------
 # Header
-# --------------------------------------------------
-col1, col2 = st.columns([3, 1])
+col1, col2, col3 = st.columns([3, 1, 1])
 with col1:
-    st.title("🧠 NeuroHack - Long-Term Memory AI")
-    st.markdown("**Retaining and recalling information across 1000+ conversation turns**")
+    st.title("🧠 NeuroHack - Memory AI")
+    st.markdown("**Conversational AI with long-term memory**")
 with col2:
     st.metric("Current Turn", st.session_state.turn_count)
-    st.metric("User ID", st.session_state.user_id[:10])
+with col3:
+    st.metric("User ID", st.session_state.user_id[:8])
 
-# --------------------------------------------------
-# Sidebar - Memory Management & Analytics
-# --------------------------------------------------
+# Sidebar
 with st.sidebar:
-    st.header("📊 Memory Analytics")
+    st.header("📊 Memory Stats")
     
-    # Get memory statistics
-    stats = st.session_state.memory_controller.get_memory_summary()
+    try:
+        summary = st.session_state.memory_controller.get_memory_summary()
+        st.metric("Total Memories", summary.get('total_memories', 0))
+        st.metric("Conversations", summary.get('conversation_turns', 0))
+        
+        # Show architecture info
+        architecture = summary.get('architecture', 'unknown')
+        if architecture == 'single-call-optimized':
+            st.success("✨ Optimized Mode Active")
+    except Exception as e:
+        st.warning(f"Could not load stats: {e}")
     
-    # Key metrics
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Total Memories", stats.get('total_memories', 0))
-    with col2:
-        st.metric("Utilization", f"{stats.get('utilization_rate', 0)}%")
-    
-    # Memory type distribution
-    if stats.get('type_distribution'):
-        st.subheader("Memory Types")
-        for mem_type, count in stats['type_distribution'].items():
-            st.progress(min(count / max(stats['total_memories'], 1), 1.0), 
-                       text=f"{mem_type}: {count}")
-    
-    # Controls
     st.divider()
-    st.subheader("Controls")
     
-    if st.button("🔄 Refresh All Data"):
-        st.rerun()
+    st.header("Debug Controls")
+    st.session_state.show_debug = st.toggle(
+        "Show Memory Logic Breakdown", 
+        value=st.session_state.show_debug
+    )
     
-    if st.button("📊 Show Memory Details"):
-        st.session_state.show_memory_details = not st.session_state.show_memory_details
+    st.divider()
     
-    if st.button("🧹 Clear Conversation"):
+    if st.button("🔄 Clear & Restart"):
         st.session_state.messages = []
         st.session_state.conversation_history = []
         st.session_state.turn_count = 1
-        st.success("Conversation cleared!")
-    
-    # Export option
-    if st.button("💾 Export Memory Log"):
-        import json
-        export_data = {
-            "user_id": st.session_state.user_id,
-            "total_turns": st.session_state.turn_count,
-            "memory_stats": stats,
-            "conversation_summary": st.session_state.conversation_history[-10:] if st.session_state.conversation_history else []
-        }
-        st.download_button(
-            label="Download JSON",
-            data=json.dumps(export_data, indent=2),
-            file_name=f"memory_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json"
-        )
+        st.success("Restarted!")
+        st.rerun()
 
-# --------------------------------------------------
-# Main Layout
-# --------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["💬 Chat", "📚 Memory Bank", "📈 Analytics"])
+# Main Tabs
+tab1, tab2, tab3 = st.tabs(["💬 Chat", "🗂️ Memory Explorer", "📈 Analytics"])
 
+# ===== TAB 1: Chat =====
 with tab1:
-    # Chat interface
-    st.subheader("Conversation")
+    st.subheader("Chat Interface")
     
     # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.write(message["content"])
             
-            # Show memory indicators for assistant messages
-            if message["role"] == "assistant" and "metadata" in message:
-                if message["metadata"].get("memories_used"):
-                    with st.expander("🔍 Memories Used"):
-                        for mem in message["metadata"]["memories_used"]:
-                            st.caption(f"**{mem.get('key', 'Unknown')}**: {mem.get('value', '')[:100]}...")
+            # Show debug info if enabled
+            if st.session_state.show_debug and message["role"] == "assistant" and "metadata" in message:
+                meta = message["metadata"]
+                
+                with st.expander("🔍 Memory Logic Breakdown"):
+                    # Intent Detection
+                    st.subheader("1. Intent Detection")
+                    intent = meta.get("intent", "UNKNOWN")
+                    st.write(f"Detected Intent: `{intent}`")
+                    
+                    # Memory Retrieval
+                    st.subheader("2. Memory Retrieval")
+                    retrieved = meta.get("retrieved_memories", [])
+                    if retrieved:
+                        for m in retrieved:
+                            score = m.get('retrieval_score', m.get('score', 0.0))
+                            mem_type = m.get('type', m.get('key', 'unknown'))
+                            mem_value = m.get('value', 'N/A')
+                            st.markdown(f"- **{mem_type.upper()}**: {mem_value} (Score: {score:.2f})")
+                    else:
+                        st.write("No relevant memories retrieved.")
+                    
+                    # New Memories Extracted
+                    st.subheader("3. New Memories Extracted")
+                    extracted = meta.get("extracted_memories", [])
+                    if extracted:
+                        for m in extracted:
+                            mem_type = m.get('type', m.get('key', 'unknown'))
+                            mem_value = m.get('value', 'N/A')
+                            st.markdown(f"- **{mem_type.upper()}**: {mem_value}")
+                    else:
+                        st.write("No new memories extracted.")
+                    
+                    # Processing Time
+                    processing_time = meta.get("processing_time", 0)
+                    api_time = meta.get("api_time", 0)
+                    api_calls = meta.get("api_calls", 1)
+                    
+                    st.caption(f"Processing Time: {processing_time:.4f}s | API Time: {api_time:.4f}s | API Calls: {api_calls}")
     
     # Chat input
-    if prompt := st.chat_input("Type your message here..."):
+    if prompt := st.chat_input("Type your message..."):
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         
         with st.chat_message("user"):
             st.write(prompt)
         
-        # Process turn with memory
+        # Process turn
         with st.chat_message("assistant"):
-            with st.spinner("Thinking with long-term memory..."):
-                result = st.session_state.memory_controller.process_turn(
-                    user_input=prompt,
-                    turn_number=st.session_state.turn_count
-                )
-                
-                # Display response
-                st.write(result["response"])
-                
-                # Show memory insights
-                if result.get("retrieved_memories"):
-                    with st.expander(f"🎯 Used {len(result['retrieved_memories'])} memories"):
-                        for i, mem in enumerate(result["retrieved_memories"], 1):
-                            st.markdown(f"""
-                            **{i}. {mem.get('key', 'Memory')}**  
-                            *{mem.get('value', '')[:100]}...*  
-                            Score: `{mem.get('retrieval_score', 0):.2f}` • Type: `{mem.get('type', 'unknown')}`
-                            """)
-                
-                # Store metadata
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": result["response"],
-                    "metadata": {
-                        "memories_used": result.get("retrieved_memories", []),
-                        "processing_time": result.get("processing_time", 0)
-                    }
-                })
-        
-        # Update conversation history
-        st.session_state.conversation_history.append({
-            "turn": st.session_state.turn_count,
-            "user_input": prompt,
-            "response": result["response"],
-            "memories_extracted": len(result.get("extracted_memories", [])),
-            "memories_retrieved": len(result.get("retrieved_memories", [])),
-            "intent": result.get("intent", "unknown"),
-            "processing_time": result.get("processing_time", 0)
-        })
+            with st.spinner("Processing..."):
+                try:
+                    result = st.session_state.memory_controller.process_turn_optimized(
+                        user_input=prompt,
+                        turn_number=st.session_state.turn_count
+                    )
+                    
+                    # Display response
+                    response_text = result.get("response", "I couldn't process that.")
+                    st.write(response_text)
+                    
+                    # Store assistant message with metadata
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": response_text,
+                        "metadata": {
+                            "intent": result.get("intent", "UNKNOWN"),
+                            "extracted_memories": result.get("extracted_memories", []),
+                            "retrieved_memories": result.get("retrieved_memories", []),
+                            "relevant_memories_analysis": result.get("relevant_memories_analysis", []),
+                            "analysis": result.get("analysis", []),
+                            "processing_time": result.get("processing_time", 0),
+                            "api_time": result.get("api_time", 0),
+                            "api_calls": result.get("api_calls", 1)
+                        }
+                    })
+                    
+                    # Show debug info immediately for current turn if enabled
+                    if st.session_state.show_debug:
+                        with st.expander("🔍 Memory Logic Breakdown (Current Turn)", expanded=True):
+                            # Intent Detection
+                            st.subheader("1. Intent Detection")
+                            intent = result.get("intent", "UNKNOWN")
+                            st.write(f"Detected Intent: `{intent}`")
+                            
+                            # Memory Retrieval
+                            st.subheader("2. Memory Retrieval")
+                            retrieved = result.get("retrieved_memories", [])
+                            if retrieved:
+                                for m in retrieved:
+                                    score = m.get('retrieval_score', m.get('score', 0.0))
+                                    mem_type = m.get('type', m.get('key', 'unknown'))
+                                    mem_value = m.get('value', 'N/A')
+                                    st.markdown(f"- **{mem_type.upper()}**: {mem_value} (Score: {score:.2f})")
+                            else:
+                                st.write("No relevant memories retrieved.")
+                            
+                            # New Memories Extracted
+                            st.subheader("3. New Memories Extracted")
+                            extracted = result.get("extracted_memories", [])
+                            if extracted:
+                                for m in extracted:
+                                    mem_type = m.get('type', m.get('key', 'unknown'))
+                                    mem_value = m.get('value', 'N/A')
+                                    st.markdown(f"- **{mem_type.upper()}**: {mem_value}")
+                            else:
+                                st.write("No new memories extracted.")
+                            
+                            # Processing Time and Performance
+                            processing_time = result.get("processing_time", 0)
+                            api_time = result.get("api_time", 0)
+                            api_calls = result.get("api_calls", 1)
+                            overhead = processing_time - api_time
+                            
+                            st.caption(f"Total: {processing_time:.4f}s | API: {api_time:.4f}s | Overhead: {overhead:.4f}s | Calls: {api_calls}")
+                    
+                    # Update conversation history
+                    st.session_state.conversation_history.append({
+                        "turn": st.session_state.turn_count,
+                        "user_input": prompt,
+                        "response": response_text
+                    })
+                    
+                except Exception as e:
+                    st.error(f"Error processing message: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": f"Sorry, I encountered an error: {str(e)}",
+                        "metadata": {}
+                    })
         
         # Increment turn counter
         st.session_state.turn_count += 1
         
-        # Auto-refresh to show updates
+        # Auto-refresh
         st.rerun()
 
-# In the sidebar or Memory Bank tab, add category selection
+# ===== TAB 2: Memory Explorer =====
 with tab2:
-    # Memory bank visualization
-    st.subheader("Long-Term Memory Storage")
+    st.subheader("🗂️ Stored Memories")
     
-    # Category-based memory view
-    st.subheader("Browse by Category")
-    
-    categories = [
-        "Personal Information", "Education", "Hobbies & Interests",
-        "Preferences", "Skills", "Goals"
-    ]
-    
-    selected_category = st.selectbox("Select category:", ["All Memories"] + categories)
-    
-    if selected_category != "All Memories":
-        # Map display categories to internal concepts
-        category_map = {
-            "Personal Information": ["name", "identity", "location", "job", "age"],
-            "Education": ["education", "degree", "year", "subjects"],
-            "Hobbies & Interests": ["hobbies", "sports", "games", "preferences"],
-            "Preferences": ["preferences"],
-            "Skills": ["skills", "languages"],
-            "Goals": ["goals", "plans"]
-        }
+    try:
+        # Fetch all memories from database
+        conn = get_db_connection()
+        cursor = conn.cursor()
         
-        # Get memories for selected category
-        category_concepts = category_map.get(selected_category, [])
-        all_memories = st.session_state.memory_controller.search_memories("", threshold=0)
+        query = f"""
+            SELECT key, value, type, created_at, updated_at 
+            FROM memories 
+            WHERE user_id = {PARAM_PLACEHOLDER}
+            ORDER BY updated_at DESC
+        """
+        cursor.execute(query, (st.session_state.user_id,))
         
-        category_memories = []
-        for mem in all_memories:
-            memory_key = mem.get('key', '').lower()
-            for concept in category_concepts:
-                if concept in memory_key:
-                    category_memories.append(mem)
-                    break
+        memories = cursor.fetchall()
+        conn.close()
         
-        if category_memories:
-            st.write(f"Found {len(category_memories)} memories in {selected_category}:")
-            for mem in category_memories:
-                with st.expander(f"📍 {mem.get('key', 'Unknown')}"):
-                    st.write(f"**Value:** {mem.get('value', '')}")
-                    st.write(f"**Type:** {mem.get('type', 'unknown')}")
-                    st.write(f"**Confidence:** {mem.get('confidence', 0):.2f}")
-                    st.write(f"**Source Turn:** {mem.get('source_turn', 'N/A')}")
-                    st.write(f"**Last Used:** {mem.get('last_used_turn', 'Never')}")
-        else:
-            st.info(f"No memories found in {selected_category} category.")
+        if memories:
+            # Create DataFrame
+            df = pd.DataFrame(memories, columns=['Key', 'Value', 'Type', 'Created', 'Updated'])
             
-with tab3:
-    # Analytics dashboard
-    st.subheader("Memory System Analytics")
-    
-    if st.session_state.conversation_history:
-        # Create analytics dataframe
-        history_df = pd.DataFrame(st.session_state.conversation_history)
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            avg_memories = history_df['memories_retrieved'].mean()
-            st.metric("Avg. Memories per Turn", f"{avg_memories:.1f}")
-        with col2:
-            avg_time = history_df['processing_time'].mean()
-            st.metric("Avg. Response Time", f"{avg_time:.2f}s")
-        with col3:
-            total_turns = len(history_df)
-            st.metric("Total Turns Processed", total_turns)
-        
-        # Visualization
-        st.subheader("Memory Usage Over Time")
-        
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=history_df['turn'],
-            y=history_df['memories_retrieved'],
-            mode='lines+markers',
-            name='Memories Retrieved',
-            line=dict(color='#FF6B6B', width=3)
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=history_df['turn'],
-            y=history_df['memories_extracted'],
-            mode='lines+markers',
-            name='Memories Extracted',
-            line=dict(color='#4ECDC4', width=3)
-        ))
-        
-        fig.update_layout(
-            title="Memory Activity Across Turns",
-            xaxis_title="Turn Number",
-            yaxis_title="Number of Memories",
-            hovermode='x unified',
-            template="plotly_white",
-            height=400
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Intent distribution
-        st.subheader("Intent Distribution")
-        intent_counts = history_df['intent'].value_counts()
-        
-        fig2 = go.Figure(data=[go.Pie(
-            labels=intent_counts.index,
-            values=intent_counts.values,
-            hole=.3,
-            marker_colors=['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
-        )])
-        
-        fig2.update_layout(
-            title="User Intent Distribution",
-            height=400
-        )
-        
-        st.plotly_chart(fig2, use_container_width=True)
-        
-        # Performance metrics table
-        st.subheader("Performance Metrics")
-        metrics_df = history_df.describe().round(3)
-        st.dataframe(metrics_df, width='stretch')
-        
-    else:
-        st.info("Start a conversation to see analytics here.")
+            # Display metrics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Memories", len(df))
+            with col2:
+                memory_types = df['Type'].value_counts()
+                most_common = memory_types.index[0] if len(memory_types) > 0 else "N/A"
+                st.metric("Most Common Type", most_common)
+            with col3:
+                st.metric("Memory Types", df['Type'].nunique())
+            
+            st.divider()
+            
+            # Filter by type
+            all_types = df['Type'].unique().tolist()
+            memory_type_filter = st.multiselect(
+                "Filter by Memory Type",
+                options=all_types,
+                default=all_types
+            )
+            
+            filtered_df = df[df['Type'].isin(memory_type_filter)] if memory_type_filter else df
+            
+            # Display table
+            st.dataframe(
+                filtered_df,
+                width="stretch",
+                hide_index=True
+            )
+            
+            # Individual memory viewer
+            if not filtered_df.empty:
+                st.subheader("Memory Details")
+                selected_key = st.selectbox("Select a memory to view details", filtered_df['Key'].tolist())
+                
+                if selected_key:
+                    memory_row = filtered_df[filtered_df['Key'] == selected_key].iloc[0]
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**Key:** {memory_row['Key']}")
+                        st.write(f"**Type:** {memory_row['Type']}")
+                    with col2:
+                        st.write(f"**Created:** {memory_row['Created']}")
+                        st.write(f"**Updated:** {memory_row['Updated']}")
+                    
+                    st.write(f"**Value:**")
+                    st.info(memory_row['Value'])
+        else:
+            st.info("No memories stored yet. Start chatting to build your memory!")
+            
+    except Exception as e:
+        st.error(f"Error loading memories: {e}")
+        import traceback
+        st.code(traceback.format_exc())
 
-# --------------------------------------------------
-# Footer
-# --------------------------------------------------
-st.divider()
-st.caption("""
-**NeuroHack Long-Term Memory System** • Built for 1000+ turn conversations  
-*Features:* Memory extraction • Intelligent retrieval • Decay mechanisms • Real-time analytics
-""")
+# ===== TAB 3: Analytics =====
+with tab3:
+    st.subheader("📈 Memory Analytics")
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Memory count over time
+        query = f"""
+            SELECT DATE(created_at) as date, COUNT(*) as count
+            FROM memories
+            WHERE user_id = {PARAM_PLACEHOLDER}
+            GROUP BY DATE(created_at)
+            ORDER BY date
+        """
+        cursor.execute(query, (st.session_state.user_id,))
+        
+        daily_memories = cursor.fetchall()
+        
+        if daily_memories:
+            df_daily = pd.DataFrame(daily_memories, columns=['Date', 'Count'])
+            st.subheader("Memory Creation Over Time")
+            st.line_chart(df_daily.set_index('Date'))
+        else:
+            st.info("No data available for time-based analysis yet.")
+        
+        st.divider()
+        
+        # Memory type distribution
+        query = f"""
+            SELECT type, COUNT(*) as count
+            FROM memories
+            WHERE user_id = {PARAM_PLACEHOLDER}
+            GROUP BY type
+            ORDER BY count DESC
+        """
+        cursor.execute(query, (st.session_state.user_id,))
+        
+        type_dist = cursor.fetchall()
+        
+        if type_dist:
+            df_types = pd.DataFrame(type_dist, columns=['Memory Type', 'Count'])
+            st.subheader("Memory Type Distribution")
+            st.bar_chart(df_types.set_index('Memory Type'))
+        else:
+            st.info("No memory type distribution data available yet.")
+        
+        st.divider()
+        
+        # Conversation statistics
+        st.subheader("Conversation Statistics")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Total Turns", st.session_state.turn_count - 1)
+            st.metric("Messages Sent", len([m for m in st.session_state.messages if m["role"] == "user"]))
+        with col2:
+            st.metric("Responses Received", len([m for m in st.session_state.messages if m["role"] == "assistant"]))
+            
+            # Average processing time
+            processing_times = [
+                m.get("metadata", {}).get("processing_time", 0) 
+                for m in st.session_state.messages 
+                if m["role"] == "assistant" and "metadata" in m
+            ]
+            avg_time = sum(processing_times) / len(processing_times) if processing_times else 0
+            st.metric("Avg Processing Time", f"{avg_time:.3f}s")
+        
+        # Performance metrics (if available)
+        st.divider()
+        st.subheader("Performance Metrics")
+        
+        api_calls = [
+            m.get("metadata", {}).get("api_calls", 0)
+            for m in st.session_state.messages
+            if m["role"] == "assistant" and "metadata" in m
+        ]
+        
+        if api_calls:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                total_calls = sum(api_calls)
+                st.metric("Total API Calls", total_calls)
+            with col2:
+                avg_calls = sum(api_calls) / len(api_calls) if api_calls else 0
+                st.metric("Avg Calls/Turn", f"{avg_calls:.1f}")
+            with col3:
+                if avg_calls > 0:
+                    efficiency = f"{(1/avg_calls)*100:.0f}%"
+                    st.metric("Efficiency", efficiency)
+        
+        conn.close()
+        
+    except Exception as e:
+        st.error(f"Error loading analytics: {e}")
+        import traceback
+        st.code(traceback.format_exc())

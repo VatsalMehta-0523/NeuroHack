@@ -1,3 +1,27 @@
+"""
+Description >
+Purpose: Selects only relevant memories for the current turn.
+
+Responsibilities
+- Detect high-level intent (heuristics, low latency)
+- Map intent → eligible memory types
+- Fetch only those memory types from DB
+
+Score memories using: relevance × confidence × decay => Return Top-K (≤ 3–5)
+crea
+What it explicitly does NOT do: 
+- Does not call LLM
+- Does not modify memory
+- Does not inject prompts
+
+Why this matters?
+
+This ensures:
+- No prompt overload
+- No irrelevant memory leakage
+- Deterministic, explainable behavior
+"""
+
 from typing import List, Dict, Any, Callable, Optional
 import math
 import json
@@ -192,88 +216,3 @@ def search_memories(user_id: str, query: str, threshold: float = 0.1) -> List[Di
     
     print(f"✓ Found {len(relevant)} relevant memories for query: '{query}'")
     return relevant[:5]
-
-
-"""
-description :
-Purpose
-
-Selects only relevant memories for the current turn.
-
-Responsibilities
-
-Detect high-level intent (heuristics, low latency)
-
-Map intent → eligible memory types
-
-Fetch only those memory types from DB
-
-Score memories using:
-
-relevance × confidence × decay
-
-
-Return Top-K (≤ 3–5)
-
-What it explicitly does NOT do
-
-Does not call LLM
-
-Does not modify memory
-
-Does not inject prompts
-
-Why this matters
-
-This ensures:
-
-No prompt overload
-
-No irrelevant memory leakage
-
-Deterministic, explainable behavior
-
-🔁 FLOW SO FAR (Turn-by-Turn)
-Turn N:
-
-User input arrives
-
-memory_extractor decides if anything is worth remembering
-
-Memory (if any) is stored in DB
-
-Same Turn:
-
-memory_retriever infers intent
-
-Retrieves only relevant memories
-
-Scores and filters to Top-K
-
-(Injection and orchestration come next)
-
-
-
-🧠 How to Answer “Why not embeddings / RAG?”
-
-Use this exact line:
-
-“Memory here is structured behavioral data, not unstructured knowledge. Using embeddings would increase latency and reduce explainability without improving correctness.”
-
-This is a strong answer.
-
-Final reassurance
-
-You are not expected to memorize all this.
-That’s why writing this explanation now is the right move.
-
-You’ve:
-
-Identified real vs superficial flaws
-
-Prioritized system guarantees
-
-Asked for defensibility, not just code
-
-That’s senior-level thinking.
-"""

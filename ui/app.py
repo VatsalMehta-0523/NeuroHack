@@ -11,6 +11,149 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.memory_controller import OptimizedMemoryController
 from core.db import get_db_connection
+import base64
+import tempfile
+from gtts import gTTS
+import streamlit.components.v1 as components
+
+import uuid
+
+# Helper: Text to Speech
+def text_to_speech_html(text):
+    """Generates HTML for an audio player with the spoken text."""
+    try:
+        # Create a unique temporary file path
+        # Windows requires closing the file before reading it again
+        temp_dir = tempfile.gettempdir()
+        temp_filename = os.path.join(temp_dir, f"speech_{uuid.uuid4()}.mp3")
+        
+        tts = gTTS(text=text, lang='en', slow=False)
+        tts.save(temp_filename)
+        
+        with open(temp_filename, "rb") as f:
+            audio_bytes = f.read()
+            
+        # Clean up safely
+        try:
+            os.remove(temp_filename)
+        except Exception:
+            pass # Best effort cleanup
+            
+        b64 = base64.b64encode(audio_bytes).decode()
+        md = f"""
+            <audio controls autoplay>
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+            </audio>
+            """
+        return md
+    except Exception as e:
+        return f"Error generating audio: {e}"
+
+# Helper: Voice Input Component
+def voice_input_component():
+    """Renders a microphone button above the chat input."""
+    # JavaScript to directly inject text into Streamlit's chat input
+    js_code = """
+    <script>
+    function startListening() {
+        if (!('webkitSpeechRecognition' in window)) {
+            alert("Web Speech API not supported in this browser.");
+            return;
+        }
+        
+        var recognition = new webkitSpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.lang = "en-US";
+        
+        var btn = document.getElementById("mic-btn");
+        var originalText = btn.innerHTML;
+        btn.innerHTML = "🔴";
+        btn.style.backgroundColor = "#ff4b4b";
+        btn.style.color = "white";
+        // Pulse animation
+        btn.classList.add("pulse");
+        
+        recognition.onresult = function(event) {
+            var transcript = event.results[0][0].transcript;
+            
+            // Find the Streamlit chat input textarea
+            var chatInput = window.parent.document.querySelector('textarea[data-testid="stChatInputTextArea"]');
+            
+            if (chatInput) {
+                // React needs the native value setter to trigger change events
+                var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+                nativeInputValueSetter.call(chatInput, transcript);
+                
+                // Dispatch input event for React to pick up the change
+                var event = new Event('input', { bubbles: true});
+                chatInput.dispatchEvent(event);
+                
+                // Focus the input
+                chatInput.focus();
+            } else {
+                console.error("Chat input not found. Copying to clipboard as fallback.");
+                navigator.clipboard.writeText(transcript);
+                alert("Speech recognized: " + transcript + "\\n(Copied to clipboard - paste it in the chat!)");
+            }
+            
+            resetButton(btn, originalText);
+        };
+        
+        recognition.onerror = function(event) {
+            console.error(event.error);
+            btn.innerHTML = "⚠️";
+            setTimeout(function() { 
+                resetButton(btn, originalText);
+            }, 2000);
+        };
+        
+        recognition.onend = function() {
+            if (btn.innerHTML.includes("🔴")) {
+                 resetButton(btn, originalText);
+            }
+        };
+        
+        recognition.start();
+    }
+    
+    function resetButton(btn, text) {
+        btn.innerHTML = text;
+        btn.style.backgroundColor = "#ffffff";
+        btn.style.color = "#31333F";
+        btn.classList.remove("pulse");
+    }
+    </script>
+    <style>
+    @keyframes pulse {
+        0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(255, 75, 75, 0.7); }
+        70% { transform: scale(1.1); box-shadow: 0 0 0 10px rgba(255, 75, 75, 0); }
+        100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(255, 75, 75, 0); }
+    }
+    .pulse {
+        animation: pulse 1.5s infinite;
+    }
+    </style>
+    <div style="display: flex; justify-content: flex-end; margin-bottom: 10px;">
+        <button id="mic-btn" onclick="startListening()" style="
+            background-color: #ffffff; 
+            border: 1px solid #e0e0e0; 
+            border-radius: 50%; 
+            width: 50px;
+            height: 50px;
+            cursor: pointer;
+            font-size: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            transition: all 0.2s;">
+            🎤
+        </button>
+    </div>
+    """
+    components.html(js_code, height=60)
+
 
 # Detect database type
 @st.cache_resource
@@ -174,8 +317,19 @@ with tab1:
                     api_calls = meta.get("api_calls", 1)
                     
                     st.caption(f"Processing Time: {processing_time:.4f}s | API Time: {api_time:.4f}s | API Calls: {api_calls}")
+            
+            # Voice Output Trigger
+            if message["role"] == "assistant":
+                col_audio, col_space = st.columns([1, 4])
+                with col_audio:
+                    if st.button("🔊 Play Audio", key=f"tts_{message.get('metadata', {}).get('processing_time', 0)}_{st.session_state.turn_count}"):
+                        st.markdown(text_to_speech_html(message["content"]), unsafe_allow_html=True)
+    
     
     # Chat input
+    # Voice Input Component (Placed above chat input)
+    voice_input_component()
+    
     if prompt := st.chat_input("Type your message..."):
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
